@@ -33,6 +33,50 @@ def _prepare_lines(lines: List[SubtitleLine], gap_ms: int, drop_sfx: bool) -> Li
     return merge_adjacent(prepared, gap_ms=gap_ms)
 
 
+def _default_api_base(provider: str) -> str:
+    if provider == "openrouter":
+        return "https://openrouter.ai/api/v1"
+    if provider == "anthropic":
+        return "https://api.anthropic.com/v1"
+    return "https://api.openai.com/v1"
+
+
+def _default_endpoint(provider: str) -> str:
+    if provider == "anthropic":
+        return "/messages"
+    return "/chat/completions"
+
+
+def _resolve_api_key(provider: str, cli_value: str) -> str:
+    if cli_value:
+        return cli_value
+    if provider == "openrouter":
+        return os.environ.get("OPENROUTER_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
+    if provider == "anthropic":
+        return os.environ.get("ANTHROPIC_API_KEY", "")
+    return os.environ.get("OPENAI_API_KEY", "")
+
+
+def _resolve_api_base(provider: str, cli_value: str) -> str:
+    if cli_value:
+        return cli_value
+    if provider == "openrouter":
+        return os.environ.get("OPENROUTER_API_BASE", "") or _default_api_base(provider)
+    if provider == "anthropic":
+        return os.environ.get("ANTHROPIC_API_BASE", "") or _default_api_base(provider)
+    return os.environ.get("OPENAI_API_BASE", "") or _default_api_base(provider)
+
+
+def _resolve_endpoint(provider: str, cli_value: str) -> str:
+    if cli_value:
+        return cli_value
+    if provider == "openrouter":
+        return os.environ.get("OPENROUTER_API_ENDPOINT", "") or _default_endpoint(provider)
+    if provider == "anthropic":
+        return os.environ.get("ANTHROPIC_API_ENDPOINT", "") or _default_endpoint(provider)
+    return os.environ.get("OPENAI_API_ENDPOINT", "") or _default_endpoint(provider)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     # Load .env first so CLI defaults can read OPENAI_* values from it.
     load_dotenv()
@@ -64,9 +108,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Generate cards using approved rows from a review TSV",
     )
     parser.add_argument(
+        "--llm-provider",
+        choices=["openai", "openrouter", "anthropic"],
+        default=os.environ.get("LLM_PROVIDER", "openai"),
+        help="LLM API provider",
+    )
+    parser.add_argument(
         "--llm-model",
-        default=os.environ.get("OPENAI_MODEL", "gpt-5-mini"),
-        help="LLM model name (or set OPENAI_MODEL)",
+        default=os.environ.get("LLM_MODEL", os.environ.get("OPENAI_MODEL", "gpt-5-mini")),
+        help="LLM model name (or set LLM_MODEL / OPENAI_MODEL)",
     )
     parser.add_argument(
         "--user-level",
@@ -76,33 +126,51 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--llm-api-key",
-        default=os.environ.get("OPENAI_API_KEY", ""),
-        help="API key for the LLM provider (or set OPENAI_API_KEY)",
+        default=os.environ.get("LLM_API_KEY", ""),
+        help="API key for selected provider (or set LLM_API_KEY)",
     )
     parser.add_argument(
         "--llm-api-base",
-        default=os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
-        help="Base URL for the LLM API",
+        default=os.environ.get("LLM_API_BASE", ""),
+        help="Base URL for the LLM API (provider-specific default when omitted)",
     )
     parser.add_argument(
         "--llm-endpoint",
-        default=os.environ.get("OPENAI_API_ENDPOINT", "/chat/completions"),
-        help="API endpoint path or full URL for the LLM request",
+        default=os.environ.get("LLM_API_ENDPOINT", ""),
+        help="API endpoint path or full URL (provider-specific default when omitted)",
     )
     parser.add_argument(
         "--llm-temperature",
         type=float,
-        default=float(os.environ.get("OPENAI_TEMPERATURE", "1.0")),
+        default=float(os.environ.get("LLM_TEMPERATURE", os.environ.get("OPENAI_TEMPERATURE", "1.0"))),
         help="Sampling temperature (some models only allow the default value)",
     )
     parser.add_argument(
         "--llm-reasoning-effort",
         choices=["minimal", "low", "medium", "high"],
-        default=os.environ.get("OPENAI_REASONING_EFFORT", "minimal"),
+        default=os.environ.get("LLM_REASONING_EFFORT", os.environ.get("OPENAI_REASONING_EFFORT", "minimal")),
         help="Reasoning effort for capable models (default: minimal)",
     )
     parser.add_argument("--llm-batch-size", type=int, default=30)
     parser.add_argument("--llm-timeout", type=int, default=60)
+    parser.add_argument(
+        "--llm-app-name",
+        default=os.environ.get("LLM_APP_NAME", os.environ.get("OPENROUTER_APP_NAME", "")),
+        help="Optional app name sent to OpenRouter",
+    )
+    parser.add_argument(
+        "--llm-site-url",
+        default=os.environ.get(
+            "LLM_SITE_URL",
+            os.environ.get("OPENROUTER_SITE_URL", os.environ.get("OPENROUTER_HTTP_REFERER", "")),
+        ),
+        help="Optional site URL sent to OpenRouter as HTTP-Referer",
+    )
+    parser.add_argument(
+        "--llm-anthropic-version",
+        default=os.environ.get("LLM_ANTHROPIC_VERSION", os.environ.get("ANTHROPIC_VERSION", "2023-06-01")),
+        help="Anthropic API version header",
+    )
     parser.add_argument(
         "--llm-debug",
         action="store_true",
@@ -110,8 +178,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--llm-debug-file",
-        default=os.environ.get("OPENAI_DEBUG_FILE", ""),
-        help="Append verbose LLM logs to this file (or set OPENAI_DEBUG_FILE)",
+        default=os.environ.get("LLM_DEBUG_FILE", os.environ.get("OPENAI_DEBUG_FILE", "")),
+        help="Append verbose LLM logs to this file (or set LLM_DEBUG_FILE)",
     )
     parser.add_argument("--dry-run", action="store_true", help="Skip media extraction")
     return parser
@@ -218,8 +286,16 @@ def main(argv: List[str] | None = None) -> int:
     en_texts = align_by_overlap(jp_lines, en_lines)
 
     if args.review_out:
-        if not args.llm_api_key:
-            print("LLM API key is required for --review-out (set --llm-api-key or OPENAI_API_KEY)", file=sys.stderr)
+        provider = args.llm_provider
+        api_key = _resolve_api_key(provider, args.llm_api_key)
+        api_base = _resolve_api_base(provider, args.llm_api_base.strip())
+        endpoint = _resolve_endpoint(provider, args.llm_endpoint.strip())
+
+        if not api_key:
+            print(
+                "LLM API key is required for --review-out (set --llm-api-key, LLM_API_KEY, or provider-specific key)",
+                file=sys.stderr,
+            )
             return 2
 
         level = args.user_level
@@ -232,14 +308,18 @@ def main(argv: List[str] | None = None) -> int:
         ]
         config = LlmConfig(
             model=args.llm_model,
-            api_key=args.llm_api_key,
-            api_base=args.llm_api_base,
-            endpoint=args.llm_endpoint,
+            api_key=api_key,
+            provider=provider,
+            api_base=api_base,
+            endpoint=endpoint,
             temperature=args.llm_temperature,
             batch_size=args.llm_batch_size,
             timeout_s=args.llm_timeout,
             level=level,
             reasoning_effort=args.llm_reasoning_effort,
+            app_name=args.llm_app_name.strip(),
+            site_url=args.llm_site_url.strip(),
+            anthropic_version=args.llm_anthropic_version,
             debug=args.llm_debug,
             debug_file=args.llm_debug_file,
         )
