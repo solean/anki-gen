@@ -8,3 +8,5 @@ output_apkg/
 __pycache__/
 *.pyc
 *.pyo
+
+.env
