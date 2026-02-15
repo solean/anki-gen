@@ -1,6 +1,8 @@
-# Anki Gen MVP
+# Anki Gen
 
-Generate Anki cards from a video plus Japanese/English subtitles.
+Generate Anki cards from anime episodes or other subtitled videos.
+
+![Anki Gen CLI Screenshot](docs/Screenshot%202026-02-14%20at%2010.03.22%E2%80%AFPM.png)
 
 ## Requirements
 - Python 3.9+
@@ -20,7 +22,6 @@ python -m anki_gen \
   --jp-srt "path/to/jp.srt" \
   --en-srt "path/to/en.srt" \
   --out-dir output \
-  --format csv
 ```
 
 Show full grouped help (with color in interactive terminals):
@@ -93,7 +94,7 @@ python -m anki_gen ... --llm-provider anthropic --llm-model claude-3-5-sonnet-la
 To debug LLM output formatting issues, add `--llm-debug` (stderr) and/or
 `--llm-debug-file output/llm_debug.log`.
 
-Edit `output/review.tsv` and flip the `approved` column, then generate cards:
+Edit `output/review.tsv` if desired and flip the `approved` column, then generate cards:
 
 ```bash
 python -m anki_gen \
