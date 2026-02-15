@@ -241,7 +241,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     output_group = parser.add_argument_group("Output")
     output_group.add_argument("--out-dir", default="output", help="Output directory")
-    output_group.add_argument("--format", choices=["csv", "apkg"], default="csv", help="Export format")
+    output_group.add_argument("--format", choices=["csv", "apkg"], default="apkg", help="Export format")
     output_group.add_argument("--deck-name", default="AnkiGen Deck", help="Deck name for APKG export")
 
     subtitle_group = parser.add_argument_group("Subtitle Processing")

@@ -31,6 +31,7 @@ python -m anki_gen --help
 ```
 
 You can force or disable ANSI coloring via `--color always` / `--color never`.
+If `--format` is omitted, output defaults to an Anki package (`.apkg`).
 
 LLM-assisted review (two-step):
 
@@ -101,7 +102,6 @@ python -m anki_gen \
   --video "path/to/video.mkv" \
   --review-in output/review.tsv \
   --out-dir output \
-  --format apkg
 ```
 
 With `--review-in`, card text uses reviewed fields:
