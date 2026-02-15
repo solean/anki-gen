@@ -1,27 +1,150 @@
 from __future__ import annotations
 
 import argparse
+import io
 import os
+import shutil
 import sys
-from typing import List
+from contextlib import contextmanager
+from textwrap import dedent
+from typing import TYPE_CHECKING, List
 
-from .align import align_by_overlap
+from rich.console import Console
+from rich_argparse import ArgumentDefaultsRichHelpFormatter, RawDescriptionRichHelpFormatter
+
 from .dotenv import load_dotenv
-from .export import export_apkg, export_csv
-from .llm import LlmConfig, LlmError, LlmItem, select_candidates
-from .media import ensure_dir, extract_audio, extract_image, MediaError
-from .models import CardLine, SubtitleLine
-from .review import ReviewRow, load_review_tsv, write_review_tsv
-from .srt import load_srt, merge_adjacent, MissingDependencyError as SrtDependencyError
-from .text import (
-    MissingDependencyError as TextDependencyError,
-    is_sfx_only,
-    normalize_text,
-    romaji_text,
-)
+
+if TYPE_CHECKING:
+    from .review import ReviewRow
+    from .models import SubtitleLine
 
 
-def _prepare_lines(lines: List[SubtitleLine], gap_ms: int, drop_sfx: bool) -> List[SubtitleLine]:
+_COLOR_MODE = os.environ.get("ANKI_GEN_COLOR", "auto")
+_STDOUT_CONSOLE = Console()
+_STDERR_CONSOLE = Console(stderr=True)
+
+
+class _CliHelpFormatter(ArgumentDefaultsRichHelpFormatter, RawDescriptionRichHelpFormatter):
+    group_name_formatter = str
+
+    def _get_help_string(self, action: argparse.Action) -> str:
+        help_text = action.help or ""
+        if "%(default)" in help_text:
+            return help_text
+        if action.default in (None, False, argparse.SUPPRESS):
+            return help_text
+        if not action.option_strings:
+            return help_text
+        return f"{help_text} (default: %(default)s)"
+
+    def format_help(self) -> str:
+        should_style = _COLOR_MODE == "always" or (
+            _COLOR_MODE == "auto"
+            and not os.environ.get("NO_COLOR")
+            and hasattr(sys.stdout, "isatty")
+            and sys.stdout.isatty()
+        )
+        buffer = io.StringIO()
+        render_console = Console(
+            file=buffer,
+            width=self.console.width,
+            no_color=not should_style,
+            force_terminal=should_style,
+            color_system="truecolor" if should_style else None,
+            record=True,
+        )
+        render_console.print(self, crop=False)
+        return render_console.export_text(styles=should_style)
+
+
+def _set_color_mode(mode: str) -> None:
+    global _COLOR_MODE, _STDOUT_CONSOLE, _STDERR_CONSOLE
+
+    normalized = mode.lower().strip()
+    if normalized not in {"auto", "always", "never"}:
+        return
+
+    _COLOR_MODE = normalized
+    no_color = normalized == "never" or (normalized == "auto" and bool(os.environ.get("NO_COLOR")))
+    force_terminal = True if normalized == "always" else None
+    color_system = "truecolor" if normalized == "always" else None
+
+    _STDOUT_CONSOLE = Console(no_color=no_color, force_terminal=force_terminal, color_system=color_system)
+    _STDERR_CONSOLE = Console(
+        stderr=True,
+        no_color=no_color,
+        force_terminal=force_terminal,
+        color_system=color_system,
+    )
+
+
+def _load_color_mode_from_argv(argv: List[str]) -> None:
+    for idx, arg in enumerate(argv):
+        if arg == "--color" and idx + 1 < len(argv):
+            _set_color_mode(argv[idx + 1])
+        elif arg.startswith("--color="):
+            _set_color_mode(arg.split("=", 1)[1])
+
+
+_set_color_mode(_COLOR_MODE)
+
+
+def _print_error(message: str) -> None:
+    _STDERR_CONSOLE.print(f"[bold red]error:[/bold red] {message}")
+
+
+def _print_info(message: str) -> None:
+    _STDOUT_CONSOLE.print(f"[bold cyan][info][/bold cyan] {message}")
+
+
+def _print_success(message: str) -> None:
+    _STDOUT_CONSOLE.print(f"[bold green][ok][/bold green] {message}")
+
+
+def _print_review_summary(review_rows: List["ReviewRow"], llm_selection_count: int) -> None:
+    total = len(review_rows)
+    if total <= 0:
+        return
+
+    suggested_keep = sum(1 for row in review_rows if row.llm_keep)
+    suggested_omit = total - suggested_keep
+    keep_pct = (suggested_keep / total) * 100
+    omit_pct = (suggested_omit / total) * 100
+    missing_decisions = max(0, total - llm_selection_count)
+
+    _STDOUT_CONSOLE.print("[bold]Review summary[/bold]")
+    _STDOUT_CONSOLE.print(f"  Total candidate lines: [bold]{total}[/bold]")
+    _STDOUT_CONSOLE.print(f"  Suggested keep: [green]{suggested_keep}[/green] ({keep_pct:.1f}%)")
+    _STDOUT_CONSOLE.print(f"  Suggested omit: [yellow]{suggested_omit}[/yellow] ({omit_pct:.1f}%)")
+    if missing_decisions:
+        _STDOUT_CONSOLE.print(
+            f"  Missing LLM decisions: [yellow]{missing_decisions}[/yellow] (defaulted to omit)"
+        )
+    _STDOUT_CONSOLE.print(f"  Prefilled approved rows: [green]{suggested_keep}[/green]")
+
+
+@contextmanager
+def _spinner(message: str, *, enabled: bool = True):
+    if not enabled or not _STDERR_CONSOLE.is_terminal or _COLOR_MODE == "never":
+        yield
+        return
+
+    with _STDERR_CONSOLE.status(message, spinner="dots"):
+        yield
+
+
+class _CliArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        _print_error(message)
+        self.exit(2)
+
+
+def _prepare_lines(lines: List["SubtitleLine"], gap_ms: int, drop_sfx: bool) -> List["SubtitleLine"]:
+    from .models import SubtitleLine
+    from .srt import merge_adjacent
+    from .text import is_sfx_only, normalize_text
+
     prepared: List[SubtitleLine] = []
     for line in lines:
         if drop_sfx and is_sfx_only(line.text):
@@ -81,84 +204,126 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Load .env first so CLI defaults can read OPENAI_* values from it.
     load_dotenv()
 
-    parser = argparse.ArgumentParser(description="Generate Anki cards from video + JP/EN subtitles")
-    parser.add_argument("--video", required=True, help="Path to the video file")
-    parser.add_argument("--jp-srt", help="Path to Japanese .srt")
-    parser.add_argument("--en-srt", help="Path to English .srt")
-    parser.add_argument("--out-dir", default="output", help="Output directory")
-    parser.add_argument("--format", choices=["csv", "apkg"], default="csv")
-    parser.add_argument("--deck-name", default="AnkiGen Deck", help="Deck name for apkg export")
-    parser.add_argument("--audio-track", type=int, default=0, help="Audio track index for ffmpeg")
-    parser.add_argument("--video-track", type=int, default=0, help="Video track index for ffmpeg")
-    parser.add_argument("--gap-merge-ms", type=int, default=400, help="Merge lines with small gaps")
-    parser.add_argument("--pad-before-ms", type=int, default=100, help="Audio padding before line")
-    parser.add_argument("--pad-after-ms", type=int, default=200, help="Audio padding after line")
-    parser.add_argument("--limit", type=int, default=0, help="Process only the first N lines")
+    width = shutil.get_terminal_size((110, 24)).columns
+
+    def formatter_factory(prog: str) -> _CliHelpFormatter:
+        return _CliHelpFormatter(
+            prog,
+            max_help_position=34,
+            width=max(88, min(120, width)),
+            console=_STDOUT_CONSOLE,
+        )
+
+    parser = _CliArgumentParser(
+        prog="anki-gen",
+        description="Generate Anki cards from video + JP/EN subtitles.",
+        formatter_class=formatter_factory,
+        epilog=dedent(
+            """\
+            Examples:
+              python -m anki_gen --video ep01.mkv --jp-srt jp.srt --en-srt en.srt
+              python -m anki_gen --video ep01.mkv --jp-srt jp.srt --en-srt en.srt --review-out output/review.tsv
+              python -m anki_gen --video ep01.mkv --review-in output/review.tsv --format apkg --deck-name "Episode 1"
+            """
+        ),
+    )
     parser.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default=os.environ.get("ANKI_GEN_COLOR", "auto"),
+        help="Colorized CLI output mode",
+    )
+
+    input_group = parser.add_argument_group("Input")
+    input_group.add_argument("--video", required=True, help="Path to video file")
+    input_group.add_argument("--jp-srt", help="Path to Japanese .srt")
+    input_group.add_argument("--en-srt", help="Path to English .srt")
+
+    output_group = parser.add_argument_group("Output")
+    output_group.add_argument("--out-dir", default="output", help="Output directory")
+    output_group.add_argument("--format", choices=["csv", "apkg"], default="csv", help="Export format")
+    output_group.add_argument("--deck-name", default="AnkiGen Deck", help="Deck name for APKG export")
+
+    subtitle_group = parser.add_argument_group("Subtitle Processing")
+    subtitle_group.add_argument("--gap-merge-ms", type=int, default=400, help="Merge lines with small gaps")
+    subtitle_group.add_argument("--limit", type=int, default=0, help="Process only first N lines (0 = no limit)")
+    subtitle_group.add_argument(
         "--keep-sfx",
         action="store_true",
         help="Keep SFX-only subtitle lines instead of dropping them",
     )
-    parser.add_argument(
+
+    media_group = parser.add_argument_group("Media Extraction")
+    media_group.add_argument("--audio-track", type=int, default=0, help="Audio track index for ffmpeg")
+    media_group.add_argument("--video-track", type=int, default=0, help="Video track index for ffmpeg")
+    media_group.add_argument("--pad-before-ms", type=int, default=100, help="Audio padding before line")
+    media_group.add_argument("--pad-after-ms", type=int, default=200, help="Audio padding after line")
+    media_group.add_argument("--dry-run", action="store_true", help="Skip media extraction")
+
+    review_group = parser.add_argument_group("Review Workflow")
+    review_mode = review_group.add_mutually_exclusive_group()
+    review_mode.add_argument(
         "--review-out",
         help="Write LLM review TSV to this path and exit (no media extraction)",
     )
-    parser.add_argument(
+    review_mode.add_argument(
         "--review-in",
         help="Generate cards using approved rows from a review TSV",
     )
-    parser.add_argument(
-        "--llm-provider",
-        choices=["openai", "openrouter", "anthropic"],
-        default=os.environ.get("LLM_PROVIDER", "openai"),
-        help="LLM API provider",
-    )
-    parser.add_argument(
-        "--llm-model",
-        default=os.environ.get("LLM_MODEL", os.environ.get("OPENAI_MODEL", "gpt-5-mini")),
-        help="LLM model name (or set LLM_MODEL / OPENAI_MODEL)",
-    )
-    parser.add_argument(
+    review_group.add_argument(
         "--user-level",
         choices=["beginner", "middle", "intermediate", "advanced"],
         default="intermediate",
         help="Learner proficiency for selecting appropriate vocab/grammar",
     )
-    parser.add_argument(
+
+    llm_group = parser.add_argument_group("LLM Provider")
+    llm_group.add_argument(
+        "--llm-provider",
+        choices=["openai", "openrouter", "anthropic"],
+        default=os.environ.get("LLM_PROVIDER", "openai"),
+        help="LLM API provider",
+    )
+    llm_group.add_argument(
+        "--llm-model",
+        default=os.environ.get("LLM_MODEL", os.environ.get("OPENAI_MODEL", "gpt-5-mini")),
+        help="LLM model name (or set LLM_MODEL / OPENAI_MODEL)",
+    )
+    llm_group.add_argument(
         "--llm-api-key",
         default=os.environ.get("LLM_API_KEY", ""),
         help="API key for selected provider (or set LLM_API_KEY)",
     )
-    parser.add_argument(
+    llm_group.add_argument(
         "--llm-api-base",
         default=os.environ.get("LLM_API_BASE", ""),
         help="Base URL for the LLM API (provider-specific default when omitted)",
     )
-    parser.add_argument(
+    llm_group.add_argument(
         "--llm-endpoint",
         default=os.environ.get("LLM_API_ENDPOINT", ""),
         help="API endpoint path or full URL (provider-specific default when omitted)",
     )
-    parser.add_argument(
+    llm_group.add_argument(
         "--llm-temperature",
         type=float,
         default=float(os.environ.get("LLM_TEMPERATURE", os.environ.get("OPENAI_TEMPERATURE", "1.0"))),
         help="Sampling temperature (some models only allow the default value)",
     )
-    parser.add_argument(
+    llm_group.add_argument(
         "--llm-reasoning-effort",
         choices=["minimal", "low", "medium", "high"],
         default=os.environ.get("LLM_REASONING_EFFORT", os.environ.get("OPENAI_REASONING_EFFORT", "minimal")),
-        help="Reasoning effort for capable models (default: minimal)",
+        help="Reasoning effort for capable models",
     )
-    parser.add_argument("--llm-batch-size", type=int, default=30)
-    parser.add_argument("--llm-timeout", type=int, default=60)
-    parser.add_argument(
+    llm_group.add_argument("--llm-batch-size", type=int, default=30, help="Lines per LLM request batch")
+    llm_group.add_argument("--llm-timeout", type=int, default=60, help="LLM request timeout in seconds")
+    llm_group.add_argument(
         "--llm-app-name",
         default=os.environ.get("LLM_APP_NAME", os.environ.get("OPENROUTER_APP_NAME", "")),
         help="Optional app name sent to OpenRouter",
     )
-    parser.add_argument(
+    llm_group.add_argument(
         "--llm-site-url",
         default=os.environ.get(
             "LLM_SITE_URL",
@@ -166,42 +331,51 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
         help="Optional site URL sent to OpenRouter as HTTP-Referer",
     )
-    parser.add_argument(
+    llm_group.add_argument(
         "--llm-anthropic-version",
         default=os.environ.get("LLM_ANTHROPIC_VERSION", os.environ.get("ANTHROPIC_VERSION", "2023-06-01")),
         help="Anthropic API version header",
     )
-    parser.add_argument(
+
+    debug_group = parser.add_argument_group("Debug")
+    debug_group.add_argument(
         "--llm-debug",
         action="store_true",
         help="Enable verbose LLM request/response logging to stderr",
     )
-    parser.add_argument(
+    debug_group.add_argument(
         "--llm-debug-file",
         default=os.environ.get("LLM_DEBUG_FILE", os.environ.get("OPENAI_DEBUG_FILE", "")),
         help="Append verbose LLM logs to this file (or set LLM_DEBUG_FILE)",
     )
-    parser.add_argument("--dry-run", action="store_true", help="Skip media extraction")
+
     return parser
 
 
 def main(argv: List[str] | None = None) -> int:
-    args = build_arg_parser().parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    _load_color_mode_from_argv(raw_argv)
 
-    if args.review_out and args.review_in:
-        print("Cannot use --review-out and --review-in together", file=sys.stderr)
-        return 2
+    parser = build_arg_parser()
+    args = parser.parse_args(raw_argv)
+    _set_color_mode(args.color)
 
     if args.review_in:
+        from .export import export_apkg, export_csv
+        from .media import MediaError, ensure_dir, extract_audio, extract_image
+        from .models import CardLine
+        from .review import load_review_tsv
+        from .text import MissingDependencyError as TextDependencyError, romaji_text
+
         try:
             review_rows = load_review_tsv(args.review_in)
         except FileNotFoundError:
-            print(f"Review file not found: {args.review_in}", file=sys.stderr)
+            _print_error(f"Review file not found: {args.review_in}")
             return 1
 
         approved_rows = [row for row in review_rows if row.approved]
         if not approved_rows:
-            print("No approved rows found in review file.", file=sys.stderr)
+            _print_error("No approved rows found in review file.")
             return 1
 
         out_dir = os.path.abspath(args.out_dir)
@@ -217,7 +391,7 @@ def main(argv: List[str] | None = None) -> int:
             try:
                 romaji = romaji_text(card_jp)
             except TextDependencyError as exc:
-                print(str(exc), file=sys.stderr)
+                _print_error(str(exc))
                 return 1
 
             audio_file = f"audio_{row.line_id:05d}.mp3"
@@ -255,7 +429,7 @@ def main(argv: List[str] | None = None) -> int:
                         video_track=args.video_track,
                     )
                 except MediaError as exc:
-                    print(f"Media extraction failed at line {row.line_id}: {exc}", file=sys.stderr)
+                    _print_error(f"Media extraction failed at line {row.line_id}: {exc}")
                     return 1
 
         if args.format == "csv":
@@ -263,18 +437,26 @@ def main(argv: List[str] | None = None) -> int:
         else:
             out_path = export_apkg(cards, out_dir, deck_name=args.deck_name)
 
-        print(f"Wrote {len(cards)} cards to {out_path}")
+        _print_success(f"Wrote {len(cards)} cards to {out_path}")
         return 0
 
     if not args.jp_srt or not args.en_srt:
-        print("Both --jp-srt and --en-srt are required unless --review-in is used", file=sys.stderr)
+        _print_error("Both --jp-srt and --en-srt are required unless --review-in is used")
         return 2
+
+    from .align import align_by_overlap
+    from .export import export_apkg, export_csv
+    from .media import MediaError, ensure_dir, extract_audio, extract_image
+    from .models import CardLine
+    from .review import ReviewRow, write_review_tsv
+    from .srt import MissingDependencyError as SrtDependencyError, load_srt
+    from .text import MissingDependencyError as TextDependencyError, romaji_text
 
     try:
         jp_lines = load_srt(args.jp_srt)
         en_lines = load_srt(args.en_srt)
     except SrtDependencyError as exc:
-        print(str(exc), file=sys.stderr)
+        _print_error(str(exc))
         return 1
 
     jp_lines = _prepare_lines(jp_lines, gap_ms=args.gap_merge_ms, drop_sfx=not args.keep_sfx)
@@ -286,15 +468,16 @@ def main(argv: List[str] | None = None) -> int:
     en_texts = align_by_overlap(jp_lines, en_lines)
 
     if args.review_out:
+        from .llm import LlmConfig, LlmError, LlmItem, select_candidates
+
         provider = args.llm_provider
         api_key = _resolve_api_key(provider, args.llm_api_key)
         api_base = _resolve_api_base(provider, args.llm_api_base.strip())
         endpoint = _resolve_endpoint(provider, args.llm_endpoint.strip())
 
         if not api_key:
-            print(
-                "LLM API key is required for --review-out (set --llm-api-key, LLM_API_KEY, or provider-specific key)",
-                file=sys.stderr,
+            _print_error(
+                "LLM API key is required for --review-out (set --llm-api-key, LLM_API_KEY, or provider-specific key)"
             )
             return 2
 
@@ -324,10 +507,12 @@ def main(argv: List[str] | None = None) -> int:
             debug_file=args.llm_debug_file,
         )
 
+        _print_info("Selecting candidate lines with the LLM...")
         try:
-            selections = select_candidates(llm_items, config)
+            with _spinner("Waiting for LLM responses"):
+                selections = select_candidates(llm_items, config)
         except LlmError as exc:
-            print(str(exc), file=sys.stderr)
+            _print_error(str(exc))
             return 1
 
         selection_map = {sel.line_id: sel for sel in selections}
@@ -357,8 +542,9 @@ def main(argv: List[str] | None = None) -> int:
 
         review_path = os.path.abspath(args.review_out)
         write_review_tsv(review_rows, review_path)
-        print(f"Wrote review file to {review_path}")
-        print("Edit the 'approved' column, then re-run with --review-in to generate cards.")
+        _print_success(f"Wrote review file to {review_path}")
+        _print_review_summary(review_rows, len(selection_map))
+        _print_info("Edit the 'approved' column, then re-run with --review-in to generate cards.")
         return 0
 
     out_dir = os.path.abspath(args.out_dir)
@@ -372,7 +558,7 @@ def main(argv: List[str] | None = None) -> int:
         try:
             romaji = romaji_text(jp_line.text)
         except TextDependencyError as exc:
-            print(str(exc), file=sys.stderr)
+            _print_error(str(exc))
             return 1
 
         audio_file = f"audio_{idx:05d}.mp3"
@@ -410,7 +596,7 @@ def main(argv: List[str] | None = None) -> int:
                     video_track=args.video_track,
                 )
             except MediaError as exc:
-                print(f"Media extraction failed at line {idx}: {exc}", file=sys.stderr)
+                _print_error(f"Media extraction failed at line {idx}: {exc}")
                 return 1
 
     if args.format == "csv":
@@ -418,5 +604,5 @@ def main(argv: List[str] | None = None) -> int:
     else:
         out_path = export_apkg(cards, out_dir, deck_name=args.deck_name)
 
-    print(f"Wrote {len(cards)} cards to {out_path}")
+    _print_success(f"Wrote {len(cards)} cards to {out_path}")
     return 0

@@ -23,6 +23,14 @@ python -m anki_gen \
   --format csv
 ```
 
+Show full grouped help (with color in interactive terminals):
+
+```bash
+python -m anki_gen --help
+```
+
+You can force or disable ANSI coloring via `--color always` / `--color never`.
+
 LLM-assisted review (two-step):
 
 ```bash
