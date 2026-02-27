@@ -20,8 +20,7 @@ pip install -r requirements.txt
 python -m anki_gen \
   --video "path/to/video.mkv" \
   --jp-srt "path/to/jp.srt" \
-  --en-srt "path/to/en.srt" \
-  --out-dir output \
+  --en-srt "path/to/en.srt"
 ```
 
 Show full grouped help (with color in interactive terminals):
@@ -40,7 +39,7 @@ python -m anki_gen \
   --video "path/to/video.mkv" \
   --jp-srt "path/to/jp.srt" \
   --en-srt "path/to/en.srt" \
-  --review-out output/review.tsv \
+  --review-out \
   --user-level beginner \
   --llm-model gpt-5-mini
 ```
@@ -95,13 +94,13 @@ python -m anki_gen ... --llm-provider anthropic --llm-model claude-3-5-sonnet-la
 To debug LLM output formatting issues, add `--llm-debug` (stderr) and/or
 `--llm-debug-file output/llm_debug.log`.
 
-Edit `output/review.tsv` if desired and flip the `approved` column, then generate cards:
+The command above prints the generated review file path. Edit that TSV, flip the
+`approved` column as needed, then generate cards:
 
 ```bash
 python -m anki_gen \
   --video "path/to/video.mkv" \
-  --review-in output/review.tsv \
-  --out-dir output \
+  --review-in output/20260214_220100_video-name/llm_reviews/review.tsv
 ```
 
 With `--review-in`, card text uses reviewed fields:
@@ -121,5 +120,9 @@ python -m anki_gen \
 ```
 
 ## Notes
-- Output media goes in `output/media/audio` and `output/media/img`.
+- If `--out-dir` is omitted, output defaults to `output/<timestamp>_<video>/` with:
+  - `llm_reviews/review.tsv` (when using `--review-out`)
+  - `anki_output/deck.apkg` or `anki_output/cards.tsv`
+  - `anki_output/media/audio` and `anki_output/media/img`
+- If `--out-dir` is provided, cards/media are written directly under that directory.
 - The CSV export is a tab-separated file (`cards.tsv`).

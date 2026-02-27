@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import re
 import shutil
 import sys
+from dataclasses import dataclass
 from contextlib import contextmanager
+from datetime import datetime
 from textwrap import dedent
 from typing import TYPE_CHECKING, List
 
@@ -200,6 +203,56 @@ def _resolve_endpoint(provider: str, cli_value: str) -> str:
     return os.environ.get("OPENAI_API_ENDPOINT", "") or _default_endpoint(provider)
 
 
+@dataclass(frozen=True)
+class _OutputLayout:
+    out_dir: str
+    run_root: str
+    auto_created: bool
+
+
+def _argv_has_option(argv: List[str], option_name: str) -> bool:
+    return any(arg == option_name or arg.startswith(f"{option_name}=") for arg in argv)
+
+
+def _video_slug(video_path: str) -> str:
+    stem = os.path.splitext(os.path.basename(video_path))[0].strip().lower()
+    slug = re.sub(r"[^a-z0-9._-]+", "-", stem).strip("-._")
+    return slug or "video"
+
+
+def _timestamped_run_root(video_path: str) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder_name = f"{timestamp}_{_video_slug(video_path)}"
+    return os.path.abspath(os.path.join("output", folder_name))
+
+
+def _derive_run_root_from_review(review_path: str) -> str:
+    review_abs = os.path.abspath(review_path)
+    parent = os.path.dirname(review_abs)
+    if os.path.basename(parent) == "llm_reviews":
+        return os.path.dirname(parent)
+    return parent
+
+
+def _resolve_output_layout(args: argparse.Namespace, raw_argv: List[str]) -> _OutputLayout:
+    if _argv_has_option(raw_argv, "--out-dir"):
+        out_dir = os.path.abspath(args.out_dir)
+        return _OutputLayout(out_dir=out_dir, run_root=out_dir, auto_created=False)
+
+    if args.review_in:
+        run_root = _derive_run_root_from_review(args.review_in)
+    else:
+        run_root = _timestamped_run_root(args.video)
+    out_dir = os.path.join(run_root, "anki_output")
+    return _OutputLayout(out_dir=os.path.abspath(out_dir), run_root=os.path.abspath(run_root), auto_created=True)
+
+
+def _resolve_review_out_path(review_out_arg: str, layout: _OutputLayout) -> str:
+    if review_out_arg == "AUTO" or not review_out_arg.strip():
+        return os.path.join(layout.run_root, "llm_reviews", "review.tsv")
+    return os.path.abspath(review_out_arg)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     # Load .env first so CLI defaults can read OPENAI_* values from it.
     load_dotenv()
@@ -222,8 +275,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             """\
             Examples:
               python -m anki_gen --video ep01.mkv --jp-srt jp.srt --en-srt en.srt
-              python -m anki_gen --video ep01.mkv --jp-srt jp.srt --en-srt en.srt --review-out output/review.tsv
-              python -m anki_gen --video ep01.mkv --review-in output/review.tsv --format apkg --deck-name "Episode 1"
+              python -m anki_gen --video ep01.mkv --jp-srt jp.srt --en-srt en.srt --review-out
+              python -m anki_gen --video ep01.mkv --review-in output/20260214_220100_ep01/llm_reviews/review.tsv --format apkg
             """
         ),
     )
@@ -240,7 +293,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     input_group.add_argument("--en-srt", help="Path to English .srt")
 
     output_group = parser.add_argument_group("Output")
-    output_group.add_argument("--out-dir", default="output", help="Output directory")
+    output_group.add_argument(
+        "--out-dir",
+        default=None,
+        help="Output directory (omit to use output/<timestamp>_<video>/anki_output)",
+    )
     output_group.add_argument("--format", choices=["csv", "apkg"], default="apkg", help="Export format")
     output_group.add_argument("--deck-name", default="AnkiGen Deck", help="Deck name for APKG export")
 
@@ -264,6 +321,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     review_mode = review_group.add_mutually_exclusive_group()
     review_mode.add_argument(
         "--review-out",
+        nargs="?",
+        const="AUTO",
         help="Write LLM review TSV to this path and exit (no media extraction)",
     )
     review_mode.add_argument(
@@ -359,6 +418,9 @@ def main(argv: List[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(raw_argv)
     _set_color_mode(args.color)
+    output_layout = _resolve_output_layout(args, raw_argv)
+    if output_layout.auto_created:
+        _print_info(f"Using auto output root: {output_layout.run_root}")
 
     if args.review_in:
         from .export import export_apkg, export_csv
@@ -378,7 +440,7 @@ def main(argv: List[str] | None = None) -> int:
             _print_error("No approved rows found in review file.")
             return 1
 
-        out_dir = os.path.abspath(args.out_dir)
+        out_dir = output_layout.out_dir
         audio_dir = os.path.join(out_dir, "media", "audio")
         image_dir = os.path.join(out_dir, "media", "img")
         ensure_dir(audio_dir)
@@ -467,7 +529,7 @@ def main(argv: List[str] | None = None) -> int:
 
     en_texts = align_by_overlap(jp_lines, en_lines)
 
-    if args.review_out:
+    if args.review_out is not None:
         from .llm import LlmConfig, LlmError, LlmItem, select_candidates
 
         provider = args.llm_provider
@@ -540,14 +602,14 @@ def main(argv: List[str] | None = None) -> int:
                 )
             )
 
-        review_path = os.path.abspath(args.review_out)
+        review_path = _resolve_review_out_path(args.review_out, output_layout)
         write_review_tsv(review_rows, review_path)
         _print_success(f"Wrote review file to {review_path}")
         _print_review_summary(review_rows, len(selection_map))
         _print_info("Edit the 'approved' column, then re-run with --review-in to generate cards.")
         return 0
 
-    out_dir = os.path.abspath(args.out_dir)
+    out_dir = output_layout.out_dir
     audio_dir = os.path.join(out_dir, "media", "audio")
     image_dir = os.path.join(out_dir, "media", "img")
     ensure_dir(audio_dir)
